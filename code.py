@@ -247,20 +247,23 @@ def display_calendar_events(resp_events):
         # wrap event name around second line if necessary
         event_name = magtag.wrap_nicely(event["summary"], 40)
         event_name = "\n".join(event_name[0:1])  # only wrap 1 line, truncate the rest...
-        event_start = event["start"]["dateTime"]
-        # Generate labels holding event info
-        label_event_time = label.Label(
-            font_event,
-            x=7,
-            y=46 + (event_idx * 20),
-            color=0x000000,
-            text=format_datetime(event_start),
-        )
-        magtag.splash.append(label_event_time)
+        event_desc_x_position = 7
+        if "dateTime" in event["start"]:
+            event_desc_x_position = 52
+            event_start = format_datetime(event["start"]["dateTime"])
+            # Generate labels holding event info
+            label_event_time = label.Label(
+                font_event,
+                x=7,
+                y=46 + (event_idx * 20),
+                color=0x000000,
+                text=event_start,
+            )
+            magtag.splash.append(label_event_time)
 
         label_event_desc = label.Label(
             font_event,
-            x=52,
+            x=event_desc_x_position,
             y=46 + (event_idx * 20),
             color=0x000000,
             text=event_name,
