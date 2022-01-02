@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2021 Brent Rubell, written for Adafruit Industries
 #
 # SPDX-License-Identifier: Unlicense
-
 import time
 
+import adafruit_requests
 import alarm
 import board
 import rtc
@@ -13,44 +13,51 @@ from adafruit_display_text import label
 from adafruit_magtag.magtag import MagTag
 from adafruit_oauth2 import OAuth2
 
-# Maximum amount of events to display
-MAX_EVENTS = 4
-
-# Amount of time to wait between refreshing the calendar, in minutes
-REFRESH_TIME = 30
-
-# Dict. of month names for pretty-printing the header
-MONTHS = {
-    1: "Jan",
-    2: "Feb",
-    3: "Mar",
-    4: "Apr",
-    5: "May",
-    6: "Jun",
-    7: "Jul",
-    8: "Aug",
-    9: "Sep",
-    10: "Oct",
-    11: "Nov",
-    12: "Dec",
-}
-# Dict. of day names for pretty-printing the header
-WEEKDAYS = {
-    0: "Monday",
-    1: "Tuesday",
-    2: "Wednesday",
-    3: "Thursday",
-    4: "Friday",
-    5: "Saturday",
-    6: "Sunday",
-}
+from constants import (
+    MAX_BACKOFF_COUNT,
+    MAXIMUM_BACKOFF,
+    REFRESH_TIME,
+    MAX_EVENTS,
+    MINIMUM_BACKOFF,
+    MONTHS,
+    SLEEP_MEMORY_SLOT_BACKOFF_TIMES,
+    SLEEP_MEMORY_SLOT_BACKOFF,
+    WEEKDAYS,
+    WEATHER_ICONS,
+)
 
 
-def deep_sleep():
-    print("Sleeping for %d minutes" % REFRESH_TIME)
+def deep_sleep(backoff: bool = False) -> None:
     magtag.peripherals.neopixel_disable = True
     magtag.peripherals.speaker_disable = True
+    if backoff:
+        sleep_length = alarm.sleep_memory[SLEEP_MEMORY_SLOT_BACKOFF]
+        print(f'ERROR, EXPONENTIAL BACKOFF: Sleeping for {sleep_length} seconds.')
+        backoff_alarm = alarm.time.TimeAlarm(monotonic_time=int(time.monotonic()) + sleep_length)
+        alarm.exit_and_deep_sleep_until_alarms(backoff_alarm)
+    print(f'Sleeping for {REFRESH_TIME:d} minutes')
     alarm.exit_and_deep_sleep_until_alarms(pin_alarm, time_alarm)
+
+
+def deep_sleep_exponential_backoff() -> None:
+    sleep_time = alarm.sleep_memory[SLEEP_MEMORY_SLOT_BACKOFF]
+    backoff_count = alarm.sleep_memory[SLEEP_MEMORY_SLOT_BACKOFF_TIMES]
+    if not sleep_time:
+        sleep_time = MINIMUM_BACKOFF
+        backoff_count = 0
+    if MINIMUM_BACKOFF < sleep_time < MAXIMUM_BACKOFF:
+        sleep_time *= 2
+    backoff_count += 1
+    alarm.sleep_memory[SLEEP_MEMORY_SLOT_BACKOFF] = sleep_time
+    alarm.sleep_memory[SLEEP_MEMORY_SLOT_BACKOFF_TIMES] = backoff_count
+    if backoff_count >= MAX_BACKOFF_COUNT:
+        raise ConnectionError('Unable to connect after backoff expired')
+    deep_sleep(backoff=True)
+
+
+def clear_backoff() -> None:
+    alarm.sleep_memory[SLEEP_MEMORY_SLOT_BACKOFF] = 0
+    alarm.sleep_memory[SLEEP_MEMORY_SLOT_BACKOFF_TIMES] = 0
 
 
 # Set up alarms for the different buttons and timer
@@ -58,14 +65,14 @@ pin_alarm = alarm.pin.PinAlarm(board.D14, value=False)
 time_alarm = alarm.time.TimeAlarm(monotonic_time=int(time.monotonic()) + (REFRESH_TIME * 60))
 
 # Create a new MagTag object
-magtag = MagTag()
+magtag = MagTag(debug=True)
 r = rtc.RTC()
 
-if alarm.sleep_memory[0]:
-    alarm.sleep_memory[0] = False
+# Handle pin alarm
+if isinstance(alarm.wake_alarm, alarm.pin.PinAlarm):
     print(f'Light level: {magtag.peripherals.light}')
     # Check what the light level is before we blind someone
-    NEOPIXEL_BRIGHTNESS = 0
+    NEOPIXEL_BRIGHTNESS = 0.25
     if magtag.peripherals.light < 700:
         NEOPIXEL_BRIGHTNESS = 0.5
     if magtag.peripherals.light < 1500:
@@ -78,13 +85,12 @@ if alarm.sleep_memory[0]:
     magtag.peripherals.neopixels.show()
     time.sleep(3)
     deep_sleep()
-else:
-    if alarm.wake_alarm:
-        for i in range(4):
-            time.sleep(0.5)
-            magtag.peripherals.neopixels[0] = (255, 255, 0)
-            time.sleep(0.25)
-            magtag.peripherals.neopixels[0] = (0, 0, 0)
+elif isinstance(alarm.wake_alarm, alarm.time.TimeAlarm):
+    for i in range(4):
+        time.sleep(0.5)
+        magtag.peripherals.neopixels[0] = (255, 255, 0)
+        time.sleep(0.25)
+        magtag.peripherals.neopixels[0] = (0, 0, 0)
 
 magtag.peripherals.neopixels[0] = (0, 15, 0)
 
@@ -92,11 +98,20 @@ magtag.peripherals.neopixels[0] = (0, 15, 0)
 magtag.set_background(0xFFFFFF)
 
 # Add the header
-line_header = Line(0, 30, 320, 30, color=0x000000)
-magtag.splash.append(line_header)
+line_header = Line(7, 30, 220, 30, color=0x666666)
 
+# Set up calendar event fonts
+font_event = bitmap_font.load_font("fonts/NotoSans-Regular-12.pcf")
 font_h1 = bitmap_font.load_font("fonts/Spartan-Black-13.pcf")
-label_header = label.Label(font_h1, x=7, y=15, color=0x000000)
+font_weather = bitmap_font.load_font("fonts/WeatherIcons-Regular-48.pcf")
+
+label_header = label.Label(font_h1, x=7, y=16, color=0x000000)
+forecast_icon = label.Label(font_weather, color=0x666666, anchor_point=(0.5, 0.5), anchored_position=(255, 35))
+forecast_temp = label.Label(font_h1, color=0x666666, anchor_point=(0.5, 0.5), anchored_position=(255, 70))
+
+magtag.splash.append(forecast_icon)
+magtag.splash.append(forecast_temp)
+magtag.splash.append(line_header)
 magtag.splash.append(label_header)
 
 # noinspection PyProtectedMember
@@ -108,29 +123,13 @@ if magtag.peripherals.battery < 3.5:
         magtag.peripherals.play_tone(2600, 0.1)
         time.sleep(0.2)
 
-# Set up calendar event fonts
-font_event = bitmap_font.load_font("fonts/NotoSans-Regular-12.pcf")
+# Connect to the network
+print("Connecting to network and fetching weather...")
+forecast = magtag.network._get_io_client().receive_weather(secrets["weather_location_id"])
+print("Connected.")
 
-connect_tries = 0
-connected = False
-
-while connect_tries <= 5:
-    try:
-        magtag.network.connect()
-        if magtag.network.enabled:
-            connected = True
-            break
-    except ConnectionError:
-        print("Cannot connect to network. Retrying...")
-        time.sleep(3)
-        connect_tries += 1
-
-if not connected:
-    print("Cannot connect to network. Sleeping for two minutes.")
-    for i in range(10):
-        magtag.peripherals.play_tone(1200, 0.05)
-        time.sleep(0.09)
-    magtag.exit_and_deep_sleep(120)
+forecast_icon.text = chr(WEATHER_ICONS[f'{forecast["forecast_hours_2"]["icon"]}'])
+forecast_temp.text = f'{forecast["forecast_hours_2"]["temperature"]:.1f}°F'
 
 # Initialize an OAuth2 object with GCal API scope
 scopes = ["https://www.googleapis.com/auth/calendar.readonly"]
@@ -144,15 +143,21 @@ google_auth = OAuth2(
 )
 
 
-def get_current_time(max_time=False):
+def get_current_time(max_time=False, cur_time=None):
     """
     Gets local time from Adafruit IO and converts to RFC3339 timestamp.
     """
 
-    # Get local time from Adafruit IO
-    magtag.get_local_time(location=secrets["timezone"])
+    if not max_time and not cur_time:
+        # Get local time from Adafruit IO
+        try:
+            magtag.get_local_time(location=secrets["timezone"])
+        except RuntimeError:
+            deep_sleep_exponential_backoff()
+
     # Format as RFC339 timestamp
     cur_time = r.datetime
+
     if max_time:  # maximum time to fetch events is midnight (4:59:59UTC)
         cur_time_max = time.struct_time((
             cur_time[0],
@@ -178,7 +183,7 @@ def get_current_time(max_time=False):
     return cur_time
 
 
-def get_calendar_events(calendar_id, max_events, time_min):
+def get_calendar_events(calendar_id: str, max_events: int, time_min: int) -> [object]:
     """
     Returns events on a specified calendar.
     Response is a list of events ordered by their start date/time in ascending order.
@@ -187,7 +192,7 @@ def get_calendar_events(calendar_id, max_events, time_min):
     :param time_min: Earliest time to fetch events from
     """
 
-    # parse the 'items' array so we can iterate over it easier
+    # parse the 'items' array, so we can iterate over it easier
     items = []
 
     headers = {
@@ -200,17 +205,23 @@ def get_calendar_events(calendar_id, max_events, time_min):
         "/events?maxResults={1}&timeMin={2}&timeMax={3}&orderBy=startTime"
         "&singleEvents=true".format(calendar_id, max_events, time_min, time_max)
     )
+
     print("Fetching calendar events from {0} to {1}".format(time_min, time_max))
-    resp = magtag.network.fetch(url, headers=headers)
-    resp_items = None
-    if magtag.network.check_response(resp):
-        resp_json = resp.json()
-        resp_items = resp_json["items"]
-        resp.close()
-    if not resp_items:
-        print("No events scheduled for today!")
-    for event in range(0, len(resp_items)):
-        items.append(resp_items[event])
+
+    try:
+        resp = magtag.network.fetch(url, headers=headers)
+        resp_items = None
+        if magtag.network.check_response(resp):
+            resp_json = resp.json()
+            resp_items = resp_json["items"]
+            resp.close()
+        if not resp_items:
+            print("No events scheduled for today!")
+        for event in range(0, len(resp_items)):
+            items.append(resp_items[event])
+    except (RuntimeError, ConnectionError) as ex:
+        print(f'ERROR: Could not fetch events: {ex}')
+        deep_sleep_exponential_backoff()
     return items
 
 
@@ -246,10 +257,11 @@ def display_calendar_events(resp_events):
     for event_idx in range(len(resp_events)):
         event = resp_events[event_idx]
         # wrap event name around second line if necessary
-        event_name = magtag.wrap_nicely(event["summary"], 40)
-        event_name = "\n".join(event_name[0:1])  # only wrap 1 line, truncate the rest...
         event_desc_x_position = 7
+        event_desc_length = 40
         if "dateTime" in event["start"]:
+            if event_idx < 3:
+                event_desc_length = 28
             event_desc_x_position = 52
             event_start = format_datetime(event["start"]["dateTime"])
             # Generate labels holding event info
@@ -261,6 +273,9 @@ def display_calendar_events(resp_events):
                 text=event_start,
             )
             magtag.splash.append(label_event_time)
+
+        event_name = magtag.wrap_nicely(event["summary"], event_desc_length)
+        event_name = "\n".join(event_name[0:1])  # only wrap 1 line, truncate the rest...
 
         label_event_desc = label.Label(
             font_event,
@@ -275,21 +290,23 @@ def display_calendar_events(resp_events):
 
 magtag.peripherals.neopixels[0] = (0, 255, 0)
 
+access_token_obtained = 0
+refresh_token_fail_text = 'Unable to refresh access token - has the token been revoked?'
+now = 0
+
 try:
     print("fetching local time...")
     now = get_current_time()
-    time_max = get_current_time(max_time=True)
+    time_max = get_current_time(max_time=True, cur_time=now)
 
     if not google_auth.refresh_access_token():
         magtag.peripherals.neopixels[0] = (255, 0, 0)
-        raise RuntimeError("Unable to refresh access token - has the token been revoked?")
+        print(refresh_token_fail_text)
+        deep_sleep_exponential_backoff()
     access_token_obtained = int(time.monotonic())
-except Exception:
-    for i in range(20):
-        magtag.peripherals.play_tone(800, 0.075)
-        time.sleep(0.1)
-    raise
-
+except (RuntimeError, adafruit_requests.OutOfRetries) as ex:
+    print(f'ERROR: Could not get refresh token: {ex}')
+    deep_sleep_exponential_backoff()
 
 while True:
     # check if we need to refresh token
@@ -298,12 +315,15 @@ while True:
             >= google_auth.access_token_expiration
     ):
         print("Access token expired, refreshing...")
-        if not google_auth.refresh_access_token():
-            magtag.peripherals.neopixels[0] = (255, 0, 0)
-            raise RuntimeError(
-                "Unable to refresh access token - has the token been revoked?"
-            )
-        access_token_obtained = int(time.monotonic())
+        try:
+            if not google_auth.refresh_access_token():
+                magtag.peripherals.neopixels[0] = (255, 0, 0)
+                print(refresh_token_fail_text)
+                deep_sleep_exponential_backoff()
+            access_token_obtained = int(time.monotonic())
+        except (RuntimeError, adafruit_requests.OutOfRetries) as ex:
+            print(f'ERROR (while True): Could not get refresh token: {ex}')
+            deep_sleep_exponential_backoff()
 
     magtag.peripherals.neopixels[0] = (255, 255, 0)
 
@@ -322,5 +342,5 @@ while True:
     board.DISPLAY.show(magtag.splash)
     board.DISPLAY.refresh()
 
+    clear_backoff()
     deep_sleep()
-    alarm.exit_and_deep_sleep_until_alarms(pin_alarm, time_alarm)
